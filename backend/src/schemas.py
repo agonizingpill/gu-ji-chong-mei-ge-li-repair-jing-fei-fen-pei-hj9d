@@ -24,6 +24,13 @@ class RiskInput(BaseModel):
 class ReviewInput(BaseModel):
     level:str=Field(pattern='^(low|medium|high)$')
     note:str=Field(min_length=2,max_length=200)
+class ModelVersionInput(BaseModel):
+    code:str=Field(min_length=2,max_length=40)
+    label:str=Field(min_length=2,max_length=100)
+    preset:str=Field(pattern='^(v1|v2-draft|v3-refined)$')
+class TrialStartInput(BaseModel):
+    candidate_version_id:int
+    note:str=Field(default='',max_length=300)
 class TreatmentInput(BaseModel):
     accession_id:int
     name:str=Field(min_length=2,max_length=100)

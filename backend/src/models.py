@@ -1,5 +1,5 @@
 from datetime import datetime,timezone
-from sqlalchemy import Integer,String,Float,ForeignKey,UniqueConstraint,CheckConstraint,JSON,DateTime,Boolean
+from sqlalchemy import Integer,String,Float,ForeignKey,UniqueConstraint,CheckConstraint,JSON,DateTime,Boolean,Index,text
 from sqlalchemy.orm import Mapped,mapped_column
 from .database import Base
 from .constants import FolioState,PlanState
@@ -53,6 +53,52 @@ class RiskAssessment(Base):
     review_note:Mapped[str]=mapped_column(String(200),default='')
     metrics:Mapped[dict]=mapped_column(JSON,default=dict)
     error:Mapped[str]=mapped_column(String(200),default='')
+    # 受理时锁定的模型版本：排队瞬间写入，后续主管切换现役版本不影响在途与已结单据。
+    model_version_id:Mapped[int|None]=mapped_column(ForeignKey('model_versions.id'),nullable=True)
+class ModelVersion(Base):
+    __tablename__='model_versions'
+    id:Mapped[int]=mapped_column(primary_key=True)
+    code:Mapped[str]=mapped_column(String(40),unique=True)
+    label:Mapped[str]=mapped_column(String(100))
+    # active 现役版本；candidate 仅可试跑；archived 已被替换，不再接单
+    status:Mapped[str]=mapped_column(String(20),default='candidate')
+    params:Mapped[dict]=mapped_column(JSON)
+    metrics:Mapped[dict]=mapped_column(JSON,default=dict)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    activated_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+class TrialRun(Base):
+    __tablename__='trial_runs'
+    # 数据库层兜底：同一时刻只允许一个 running 试跑（双方言部分唯一索引）。
+    __table_args__=(Index('ux_trial_running','status',unique=True,
+                          postgresql_where=text("status='running'"),
+                          sqlite_where=text("status='running'")),)
+    id:Mapped[int]=mapped_column(primary_key=True)
+    candidate_version_id:Mapped[int]=mapped_column(ForeignKey('model_versions.id'))
+    baseline_version_id:Mapped[int]=mapped_column(ForeignKey('model_versions.id'))
+    # running 可续跑；completed 整批核完；activated 候选已一次性切换为现役；discarded 主管放弃
+    status:Mapped[str]=mapped_column(String(20),default='running')
+    note:Mapped[str]=mapped_column(String(300),default='')
+    started_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    finished_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+    activated_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+    # 整批完成时的高风险漏判汇总，作为主管切换闸门的留痕
+    summary:Mapped[dict]=mapped_column(JSON,default=dict)
+class TrialItem(Base):
+    __tablename__='trial_items'
+    __table_args__=(UniqueConstraint('trial_run_id','accession_id'),)
+    id:Mapped[int]=mapped_column(primary_key=True)
+    trial_run_id:Mapped[int]=mapped_column(ForeignKey('trial_runs.id'))
+    accession_id:Mapped[int]=mapped_column(ForeignKey('accessions.id'))
+    # 发起时锁定的观测与馆员定级，试跑全程不随后续复测漂移
+    observation_id:Mapped[int]=mapped_column(ForeignKey('observations.id'))
+    librarian_level:Mapped[str]=mapped_column(String(20))
+    baseline_prediction:Mapped[str|None]=mapped_column(String(20),nullable=True)
+    candidate_prediction:Mapped[str|None]=mapped_column(String(20),nullable=True)
+    # queued/running/done/failed；唯一键保证续跑重试不会为同一册重复入队或重复计数
+    status:Mapped[str]=mapped_column(String(20),default='queued')
+    error:Mapped[str]=mapped_column(String(200),default='')
+    attempts:Mapped[int]=mapped_column(Integer,default=0)
+    updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class Treatment(Base):
     __tablename__='treatments'
     __table_args__=(CheckConstraint('estimated_cents > 0'),)

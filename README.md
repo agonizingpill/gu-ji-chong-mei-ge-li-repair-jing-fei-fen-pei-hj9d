@@ -8,10 +8,11 @@
 
 1. 入藏册件：唯一馆藏号、书名、年代、纸张；追加病害观测保留历史。已出柜卷册需重新入柜才能录入病害。
 2. 隔离柜：同册只允许一个在柜位置，柜位满时拒绝入柜。出柜释放位置并保存出柜时间。
-3. 风险分级：Redis 排队、Python worker 执行决策树、主管复核；开工和交接只接受最新观测的复核。
-4. 修复工序：方案依序建立工序依赖，资金未占用不得施工；前置工序未完成不可跳步；未施工方案撤销后可修订恢复。
-5. 专项经费：预算、占用、实付分别记录；行锁保障并发不超支；撤销返还占款，核销不得超过已占金额。
-6. 出柜借展：霉面积为 0、含水≤60%、最新低风险复核、工序及经费完成才准出柜；先交库房才准借展。
+3. 风险分级：Redis 排队、Python worker 执行决策树、主管复核；开工和交接只接受最新观测的复核。每张分级单受理瞬间锁定当时的现役模型版本，换版后在途与已结单据仍按受理时版本运算和展示。
+4. 模型试跑与切换：主管从含高风险馆员定级的已复核卷册发起试跑，发起即锁定样本卷册、观测、馆员定级与新旧版本；候选模型在独立 Redis 队列逐册影子运算，逐册比对高风险漏判。试跑中断可续跑（running/failed 滞留册重排，已核册不重复入队、不重复计数），试跑不阻塞日常分级接单。整批核完且候选版高风险漏判未变多，主管才可一次性切换为现役；漏判变多则闸门拒绝。
+5. 修复工序：方案依序建立工序依赖，资金未占用不得施工；前置工序未完成不可跳步；未施工方案撤销后可修订恢复。
+6. 专项经费：预算、占用、实付分别记录；行锁保障并发不超支；撤销返还占款，核销不得超过已占金额。
+7. 出柜借展：霉面积为 0、含水≤60%、最新低风险复核、工序及经费完成才准出柜；先交库房才准借展。
 
 ## 快速启动
 
@@ -43,9 +44,19 @@ docker compose exec backend python -m src.seed
 7. 14:10 刷新后主管复核为低风险，进入“出柜借展”，签署移交库房，释放 Q1 一位。
 8. 15:00 主管再签借展交接给澄文书展；同册重复出柜或重复借展均会拒绝。另有 GB-A032《乾隆诗稿》已核销待验收，可直接演示出柜。
 
+### 模型试跑切换演示
+
+1. 在“风险复核”页底部“候选模型试跑与切换”查看版本台账：`v1` 现役，`v2-draft`、`v3-refined` 候选。
+2. 主管对 `v2-draft` 发起试跑：系统锁定 GB-A031、GB-A034、GB-A035 三册馆员定级为高风险的已复核卷册，worker 在独立队列逐册影子运算，页面每 3 秒刷新进度。
+3. 整批核完后，`v2-draft` 在 GB-A034、GB-A035 上把高风险漏判为中风险（候选漏判 2 册，现役 0 册），“一次性切换”按钮禁用并显示闸门拦截。
+4. 对 `v3-refined` 再发起一轮，漏判与现役持平（0 对 0），满足切换条件；点击切换后 `v1` 归档、`v3-refined` 成为现役，审计留痕。
+5. 切换后修复员照常提交分级，新单“模型版本”列显示 `v3-refined`；切换前已在途或已结的单据仍显示并沿用其受理时版本。worker 中断后在试跑批次上点“续跑”，只重排未核册，已核册不重复计数。
+
 ## 算法与数据口径
 
-`backend/src/algorithm.py` 以纸张含水、虫孔数、霉面积三个输入特征运行 `DecisionTreeClassifier(max_depth=5, min_samples_leaf=4, random_state=31)`。固定 seed 生成 600 条专家规则合成样本，按标签分层分出 450 训练 / 150 留出；worker 实算宏 F1、混淆矩阵（行实际 / 列预测，低中高顺序）与数据 SHA256，并写入数据库和共享 artifacts 卷。worker 不在 HTTP 请求内运行，Redis 队列和心跳文件均实际存在。
+`backend/src/algorithm.py` 以纸张含水、虫孔数、霉面积三个输入特征运行 `DecisionTreeClassifier`。固定 seed 生成 600 条专家规则合成样本，按标签分层分出 450 训练 / 150 留出；worker 实算宏 F1、混淆矩阵（行实际 / 列预测，低中高顺序）与数据 SHA256，并写入数据库和共享 artifacts 卷。worker 不在 HTTP 请求内运行，Redis 队列和心跳文件均实际存在。
+
+模型版本通过 `PRESETS` 命名参数化：`v1` 为现役（max_depth=5/min_samples_leaf=4/random_state=31，与历史口径完全一致），`v2-draft`、`v3-refined` 是更换采样种子、标注扰动比例和树复杂度的候选。版本参数与留出指标在 `ModelVersion` 行落库且不可变；`ModelCache` 按版本 id 进程内缓存训练好的树，试跑逐册预测不重复训练。分级单 `RiskAssessment.model_version_id` 在受理时写入，worker 按该版本而非“当前现役”取模型，实现版本锁定。试跑结果只写 `TrialItem`，不产生正式分级单，也不改变任何卷册状态。
 
 合成样本用于内部可复现检查，不代表真实文保预测效果。现场主管保留最终复核权。观测不存在、未隔离、旧观测复核、预算不足、工序不完及病害未清均是独立业务拒绝条件。后台运行失败记录 `failed` 和原因，修复输入后重新提交分级。
 
@@ -59,7 +70,7 @@ docker compose exec backend python -m src.seed
 | 认证与追踪 | JWT 三角色、动作审计、请求追踪与突发请求限制中间件 |
 | ML | NumPy / scikit-learn 决策树、分层留出评估 |
 
-`backend/src/models.py` 是关系模型，`schemas.py` 是输入契约；`catalog_service.py`、`isolation_service.py`、`risk_service.py`、`treatment_service.py`、`grant_service.py`、`handover_service.py` 分别维护六模块约束，`routes.py` 只映射权限和业务调用。建表在首次启动创建，适合独立演示库。
+`backend/src/models.py` 是关系模型，`schemas.py` 是输入契约；`catalog_service.py`、`isolation_service.py`、`risk_service.py`、`trial_service.py`、`treatment_service.py`、`grant_service.py`、`handover_service.py` 分别维护各模块约束，`routes.py` 只映射权限和业务调用。建表在首次启动创建，适合独立演示库。`trial_service.py` 负责模型版本台账、试跑发起锁定、续跑重排、漏判汇总与切换闸门；`worker.py` 同时消费日常队列 `folio:risk` 与试跑队列 `folio:risk-trial`，两条队列互不阻塞。
 
 `frontend/src/pages/` 对应六模块；`components/folio-index.js` 复用卷册索引和选择器，`ledger.js` 复用表格与表单字段，`steps.js` 绘制真实工序依赖。`api/client.js` 统一请求，`stores/workspace.js` 持有会话与卷宗，`utils/format.js` 和 `utils/forms.js` 分别处理展示和可恢复表单状态。双字体是 Noto Serif SC 与 Noto Sans SC；网络不通时浏览器使用 serif / sans-serif 回退。
 
